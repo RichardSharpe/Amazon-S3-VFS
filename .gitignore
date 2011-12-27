@@ -1,0 +1,7 @@
+Makefile
+config.log
+config.status
+configure
+module_config.h*
+*.o
+*.so
