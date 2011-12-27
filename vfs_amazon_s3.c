@@ -152,6 +152,14 @@ static const char *get_verb_str(struct s3_request_struct *req)
 }
 
 /*
+ * Get the tmp context
+ */
+static void *get_tmp_context(struct s3_request_struct *req)
+{
+	return req->tmp_context;
+}
+
+/*
  * A pair of functions to generate the hmac_sha1 hash and base64 encode it.
  * They need the request structure for the key and use it as a context for
  * talloc allocations.
@@ -181,7 +189,9 @@ static char *base64_enc(struct s3_request_struct *req,
 	BIO_get_mem_ptr(b64_filter, &bio_mem);
 
 	/* This should append a terminating null to turn it into a string */
-	ret_str = talloc_strndup(req, bio_mem->data, bio_mem->length);
+	ret_str = talloc_strndup(get_tmp_context(req), 
+				 bio_mem->data, 
+				 bio_mem->length);
 
 	BIO_free_all(b64_filter);
 
@@ -356,7 +366,7 @@ static char *get_auth_string(struct s3_request_struct *req)
 	 * Construct the first bit: Verb, Content-MD5, Content-Type, Date 
 	 * However, don't include the date if we have an x-amz-date header.
 	 */
-	string_to_enc = talloc_asprintf(talloc_tos(), 
+	string_to_enc = talloc_asprintf(get_tmp_context(req), 
 				"%s\n%s\n%s\n%s\n",
 				get_verb_str(req),
 				(req->content_md5) ? req->content_md5 : "",
@@ -394,7 +404,7 @@ static char *get_auth_string(struct s3_request_struct *req)
  */
 static char *get_uri(struct s3_request_struct *req)
 {
-	char *uri = talloc_strdup(talloc_tos(), req->uri);
+	char *uri = talloc_strdup(get_tmp_context(req), req->uri);
 	struct key_value_pair *uri_params = req->uri_params;
 
 	while (uri_params) {
@@ -435,7 +445,9 @@ int execute_request(struct amazon_context_struct *ctx,
 		return -1;
 	}
 
-	url = talloc_asprintf(talloc_tos(), "http://s3.amazonaws.com%s", uri);
+	url = talloc_asprintf(get_tmp_context(req), 
+			      "http://s3.amazonaws.com%s", 
+			      uri);
 
 	DEBUG(10, ("URL: %s\n", url));
 
@@ -445,13 +457,13 @@ int execute_request(struct amazon_context_struct *ctx,
 	 * Add headers ...
 	 */
 	if (req->content_type) {
-		content_type = talloc_asprintf(talloc_tos(),
+		content_type = talloc_asprintf(get_tmp_context(req),
 					       "Content-type: %s",
 					       req->content_type);
 		headers = curl_slist_append(headers, content_type);
 	}
 
-	host_header = talloc_asprintf(talloc_tos(), 
+	host_header = talloc_asprintf(get_tmp_context(req), 
 				      "Host: %s.s3.amazonaws.com",
 				      ctx->bucket);
 	if (!host_header) {
@@ -461,7 +473,9 @@ int execute_request(struct amazon_context_struct *ctx,
 
 	headers = curl_slist_append(headers, host_header);
 
-	date_header = talloc_asprintf(talloc_tos(), "Date: %s", req->date);
+	date_header = talloc_asprintf(get_tmp_context(req), 
+				      "Date: %s", 
+				      req->date);
 
 	headers = curl_slist_append(headers, date_header);
 
@@ -471,10 +485,10 @@ int execute_request(struct amazon_context_struct *ctx,
 
 	auth[strlen(auth) - 1] = 0;  /* There is a stray new-line here */
 
-	auth_header = talloc_asprintf(talloc_tos(), 
-					"Authorization: AWS %s:%s",
-					ctx->access_key,
-					auth);
+	auth_header = talloc_asprintf(get_tmp_context(req), 
+				      "Authorization: AWS %s:%s",
+				      ctx->access_key,
+				      auth);
 
 	DEBUG(10, ("Auth hdr: %s\n", auth_header));
 
@@ -500,6 +514,10 @@ int execute_request(struct amazon_context_struct *ctx,
 			curl_easy_strerror(c_res)));
 		return -1;
 	}
+
+	/*
+	 * Check the result and etc ...
+	 */ 
 
 	return res;
 }
