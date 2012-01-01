@@ -1,0 +1,8 @@
+vfs_amazon_s3.
+
+This is a work in progress. It is an experiment to see how well we can 
+integrate Amazon's S3 with Samba via a VFS.
+
+The idea is to allow a Samba share to be a place that you could use to drop
+files into and then have them saved up on Amazon's S3 service as a backup for
+you.

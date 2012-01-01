@@ -106,7 +106,7 @@ struct chunk_list {
 };
 
 struct s3_response_struct {
-	char *response_code;
+	char *response_code;           /* The response as a string */
 	struct key_value_pair *headers;
 	struct chunk_list *chunks;
 };
@@ -122,6 +122,7 @@ struct s3_request_struct {
 	char *uri;
 	struct key_value_pair *uri_params;
 	struct key_value_pair *amz_headers;
+	long response_code;
 	struct s3_response_struct *response;
 	struct amazon_context_struct *amz_ctx; /* Other stuff we need */
 	void *tmp_context;       /* Used to collect together tmp memory */
@@ -221,7 +222,7 @@ static char *get_hmac_sha1_b64(struct s3_request_struct *req, const char *str)
 /*
  * Handle the curl response data
  */
-static size_t recv_data(void *data, size_t size, size_t nmemb, void *ctx)
+static size_t recv_data(void *data, size_t size, size_t nmemb, void *info)
 {
 	DEBUG(10, ("Received size = %zu nmemb = %zu\n", size, nmemb));
 
@@ -229,12 +230,81 @@ static size_t recv_data(void *data, size_t size, size_t nmemb, void *ctx)
 }
 
 /*
+ * Parse a header into a KVP ... we are looking for the ':'
+ *
+ * We might need the length here at some point.
+ */
+struct key_value_pair *kvp_parse(struct s3_request_struct *req, 
+				 void *data,
+				 size_t len)
+{
+	struct key_value_pair *kvp = NULL;
+	char *sep = strchr(data, ':');
+	uint32_t key_name_len = 0;
+
+	/* Simple sanity check */
+	if ((void *)sep > (data + len)) {
+		DEBUG(0, ("Hmmm, seems that the separator is not there: %s\n",
+			data));
+		return NULL;
+	}
+
+	kvp = talloc_zero(req, struct key_value_pair);
+	if (!kvp) {
+		DEBUG(1, ("Could not allocate space for key-value-pair: %s\n",
+			data));
+		return kvp;
+	}
+
+	key_name_len = (uint32_t)((void *)sep - data);
+	/* Should check that these work */
+	kvp->key_name = talloc_strndup(kvp, data, key_name_len); 
+	kvp->key_val = talloc_strndup(kvp, ++sep, len - key_name_len - 1);
+
+	return kvp;
+}
+
+/*
  * Handle the curl response headers
  */
-static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *ctx)
+static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *info)
 {
+	struct s3_request_struct *req = (struct s3_request_struct *)info;
+
 	DEBUG(10, ("Received size = %zu nmemb = %zu\n", size, nmemb));
 	DEBUG(10, ("Hdr: %s\n", data));
+
+	/*
+	 * Create the response if needed, and the string we have is the 
+	 * response, otherwise it is a header.
+	 *
+	 * NOTE! We should probably be careful about the size of the header
+	 * below!
+	 */
+	if (!req->response) {
+		req->response = talloc_zero(req, struct s3_response_struct);
+		if (!req->response) {
+			DEBUG(0, ("Unable to allocate space for response! "
+				" (%s)\n", 
+				strerror(errno)));
+			return 0;
+		}
+		req->response->response_code = talloc_strdup(req->response,
+								data);
+		if (req->response->response_code)
+			req->response->response_code[strlen(data) - 2] = 0; 
+	} else {
+		struct key_value_pair *kvp = NULL;
+		/*
+		 * Parse it into a key-value pair and add it.
+		 */
+		kvp = kvp_parse(req, data, size);
+		if (kvp)
+			DLIST_ADD_END(req->response->headers, 
+					kvp, 
+					struct key_value_pair *);
+			
+	}
 
 	return nmemb * size;
 }
@@ -242,6 +312,8 @@ static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *ctx)
 /*
  * Create a request of the appropriate type. We fill in the important fields
  * at this time, including the data field.
+ *
+ * We defer creating the response structure until we get the header callback.
  */
 static struct s3_request_struct *create_request(enum request_type_enum request_type,
 					 struct amazon_context_struct *ctx)
@@ -503,9 +575,15 @@ int execute_request(struct amazon_context_struct *ctx,
 
 	curl_easy_setopt(ctx->c_handle, CURLOPT_NOPROGRESS, 1L);
 	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEFUNCTION, recv_data);
-	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEDATA, (void *)ctx);
+	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEDATA, (void *)req);
 	curl_easy_setopt(ctx->c_handle, CURLOPT_HEADERFUNCTION, recv_hdr);
-	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEHEADER, (void *)ctx);
+	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEHEADER, (void *)req);
+
+	/*
+	 * At this point we are finished with the tmp storage so delete it 
+	 * although we migh need the context again.
+	 */
+	talloc_free(get_tmp_context(req));
 
 	c_res = curl_easy_perform(ctx->c_handle);
 	if (c_res != CURLE_OK) {
@@ -518,6 +596,16 @@ int execute_request(struct amazon_context_struct *ctx,
 	/*
 	 * Check the result and etc ...
 	 */ 
+	c_res = curl_easy_getinfo(ctx->c_handle, 
+				  CURLINFO_RESPONSE_CODE,
+				  &req->response_code);
+	if (c_res != CURLE_OK) {
+		DEBUG(0, ("Getting response code failed: %s\n",
+			curl_easy_strerror(c_res)));
+		return -1;
+	}
+
+	DEBUG(10, ("Response code for request was: %ld\n", req->response_code));
 
 	return res;
 }
@@ -579,6 +667,11 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 	if (!execute_request(ctx, req)) {
 
 	}
+
+	/*
+	 * Free up the request because we are finished with the request
+	 */
+	talloc_free(req); 
 
 	res = pthread_create(&ctx->w_thread, 
 			     NULL, 
