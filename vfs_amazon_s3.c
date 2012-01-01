@@ -99,8 +99,8 @@ struct key_value_pair {
  * from the request.
  */
 
-struct chunk_list {
-	struct chunk_list *next, *prev;
+struct chunk_list_struct {
+	struct chunk_list_struct *next, *prev;
 	unsigned int chunk_size;
 	uint8_t *chunk;
 };
@@ -108,7 +108,7 @@ struct chunk_list {
 struct s3_response_struct {
 	char *response_code;           /* The response as a string */
 	struct key_value_pair *headers;
-	struct chunk_list *chunks;
+	struct chunk_list_struct *chunks;
 };
 
 enum request_type_enum {HDR_GET = 0, HDR_POST, HDR_PUT, HDR_DELETE, HDR_HEAD};
@@ -220,12 +220,32 @@ static char *get_hmac_sha1_b64(struct s3_request_struct *req, const char *str)
 }
 
 /*
- * Handle the curl response data
+ * Handle the curl response data. We could probably simplify our chunks by
+ * having the header on each chunk be the list as welll. Oh well.
  */
 static size_t recv_data(void *data, size_t size, size_t nmemb, void *info)
 {
-	DEBUG(10, ("Received size = %zu nmemb = %zu\n", size, nmemb));
+	struct chunk_list_struct *chunk = NULL;
+	struct s3_request_struct *req = (struct s3_request_struct *)info;
 
+	DEBUG(10, ("Received size = %zu nmemb = %zu\n", size, nmemb));
+	dump_data(10, data, size * nmemb);
+
+	chunk = talloc_zero(req->response, struct chunk_list_struct);
+	if (!chunk) {
+		DEBUG(1, ("Unable to allocate space for chunk: %s, size: %zu, "
+			" nmemb = %zu\n", strerror(errno), size, nmemb));
+		goto out;
+	}
+
+	chunk->chunk_size = size * nmemb;
+	chunk->chunk = talloc_memdup(chunk, data, size * nmemb);
+
+	DLIST_ADD_END(req->response->chunks, 
+		      chunk,
+		      struct chunk_list_struct *);
+
+out:
 	return nmemb * size;
 }
 
@@ -241,11 +261,14 @@ struct key_value_pair *kvp_parse(struct s3_request_struct *req,
 	struct key_value_pair *kvp = NULL;
 	char *sep = strchr(data, ':');
 	uint32_t key_name_len = 0;
+	uint32_t offset = (uint32_t)(sep - (char *)data);
 
 	/* Simple sanity check */
-	if ((void *)sep > (data + len)) {
-		DEBUG(0, ("Hmmm, seems that the separator is not there: %s\n",
-			data));
+
+	if (offset > len) {
+		DEBUG(0, ("Hmmm, seems that the separator is not there: %s, "
+			" len = %zu, sep = %p, data = %p, offset = %u\n",
+			data, len, sep, data, offset));
 		return NULL;
 	}
 
@@ -259,7 +282,8 @@ struct key_value_pair *kvp_parse(struct s3_request_struct *req,
 	key_name_len = (uint32_t)((void *)sep - data);
 	/* Should check that these work */
 	kvp->key_name = talloc_strndup(kvp, data, key_name_len); 
-	kvp->key_val = talloc_strndup(kvp, ++sep, len - key_name_len - 1);
+	/* Get rid of the \r\n at the end (the -2 does that */
+	kvp->key_val = talloc_strndup(kvp, ++sep, len - key_name_len - 1 - 2);
 
 	return kvp;
 }
@@ -270,9 +294,18 @@ struct key_value_pair *kvp_parse(struct s3_request_struct *req,
 static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *info)
 {
 	struct s3_request_struct *req = (struct s3_request_struct *)info;
+	char *data_p = (char *)data;
 
-	DEBUG(10, ("Received size = %zu nmemb = %zu\n", size, nmemb));
-	DEBUG(10, ("Hdr: %s\n", data));
+	DEBUG(11, ("Received size = %zu nmemb = %zu\n", size, nmemb));
+	DEBUG(11, ("Hdr: %s\n", data));
+
+	/*
+	 * Filter out the /r/n empty header
+	 */
+	if ((size * nmemb) == 2 && data_p[0] == '\r' && data_p[1] == '\n') {
+		DEBUG(10, ("Finished with headers\n"));
+		return size * nmemb;
+	}
 
 	/*
 	 * Create the response if needed, and the string we have is the 
@@ -298,7 +331,7 @@ static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *info)
 		/*
 		 * Parse it into a key-value pair and add it.
 		 */
-		kvp = kvp_parse(req, data, size);
+		kvp = kvp_parse(req, data, size *nmemb);
 		if (kvp)
 			DLIST_ADD_END(req->response->headers, 
 					kvp, 
@@ -400,7 +433,7 @@ bool set_uri(struct s3_request_struct *req, const char *uri)
 }
 
 bool add_param(struct s3_request_struct *req,
-	       struct key_value_pair *list,
+	       struct key_value_pair **list,
 	       const char *name,
 	       const char *val)
 {
@@ -409,7 +442,7 @@ bool add_param(struct s3_request_struct *req,
 	kvp->key_name = talloc_strdup(kvp, name);
 	kvp->key_val = talloc_strdup(kvp, val);
 
-	DLIST_ADD_END(list, kvp, struct key_value_pair *);
+	DLIST_ADD_END(*list, kvp, struct key_value_pair *);
 
 	return kvp != NULL;
 }
@@ -479,6 +512,7 @@ static char *get_uri(struct s3_request_struct *req)
 	char *uri = talloc_strdup(get_tmp_context(req), req->uri);
 	struct key_value_pair *uri_params = req->uri_params;
 
+	DEBUG(10, ("uri_params = %p\n", uri_params));
 	while (uri_params) {
 		uri = talloc_asprintf_append(uri, 
 			(req->uri_params == uri_params) ? "?%s" : "&%s", 
@@ -659,13 +693,17 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 		return -1;
 	}
 
-	if (!add_param(req, req->uri_params, "max-keys", "0")) {
+	if (!add_param(req, &req->uri_params, "max-keys", "0")) {
 		DEBUG(0, ("Unable to add params (%s)\n", strerror(errno)));
 		return -1;
 	}
 
-	if (!execute_request(ctx, req)) {
+	DEBUG(10, ("req->uri_params = %p\n", req->uri_params));
 
+	if (!execute_request(ctx, req)) {
+		DEBUG(0, ("Unable to execute request, disabled\n"));
+		ctx->enabled = false;
+		curl_easy_cleanup(ctx->c_handle);
 	}
 
 	/*
