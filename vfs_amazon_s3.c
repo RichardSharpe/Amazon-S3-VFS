@@ -28,6 +28,9 @@
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
 
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_VFS
 
@@ -109,6 +112,7 @@ struct s3_response_struct {
 	char *response_code;           /* The response as a string */
 	struct key_value_pair *headers;
 	struct chunk_list_struct *chunks;
+	struct key_value_pair *error;  /* Might have to move       */
 };
 
 enum request_type_enum {HDR_GET = 0, HDR_POST, HDR_PUT, HDR_DELETE, HDR_HEAD};
@@ -528,6 +532,70 @@ static char *get_uri(struct s3_request_struct *req)
 }
 
 /*
+ * Parse the chunk which should be a bunch of XML into an error list ...
+ */
+static bool parse_error_xml(struct s3_response_struct *response)
+{
+	bool res = false;
+	xmlDocPtr doc = NULL;
+	xmlNodePtr cur = NULL;
+
+	if (!response->chunks) {
+		DEBUG(10, ("No XML doc to parse\n"));
+		return res;
+	}
+
+	doc = xmlParseMemory(response->chunks->chunk, 
+			     response->chunks->chunk_size);
+
+	if (!doc) 
+		goto error;
+
+	cur = xmlDocGetRootElement(doc);
+
+	if (xmlStrcmp(cur->name, (const xmlChar *)"Error")) {
+		DEBUG(1, ("No Error node in XML document\n"));
+		dump_data(1, 
+			response->chunks->chunk, 
+			response->chunks->chunk_size);
+		goto error;
+	}
+
+	/*
+	 * Now, get the fields ...
+	 */
+	cur = cur->xmlChildrenNode;
+	while (cur != NULL) {
+		struct key_value_pair *kvp = talloc_zero(response, 
+							struct key_value_pair);
+
+		if (!kvp) {
+			DEBUG(1, ("Could not allocate KVP: %s\n",
+				strerror(errno)));
+			goto error;
+		}
+
+		kvp->key_name = (char *)cur->name;
+		kvp->key_val = xmlNodeListGetString(doc, 
+						cur->xmlChildrenNode, 1);
+
+		DLIST_ADD_END(response->error, 
+				kvp, 
+				struct key_value_pair *);
+
+		cur = cur->next;
+	}
+
+	return res;
+
+error:
+	if (doc)
+		xmlFreeDoc(doc);
+
+	return false;
+}
+
+/*
  * Execute an HTTP request via CURL, including handling the authorization 
  * header. We handle all the curl stuff here.
  */
@@ -641,6 +709,21 @@ int execute_request(struct amazon_context_struct *ctx,
 
 	DEBUG(10, ("Response code for request was: %ld\n", req->response_code));
 
+	if (req->response_code != 200) {
+		struct key_value_pair *error = NULL;
+		(void)parse_error_xml(req->response);
+		DEBUG(1, ("Request failed: "));
+		error = req->response->error;
+		while (error) {
+			DEBUG(1, ("%s = %s, ",
+				error->key_name,
+				error->key_val));
+			error = error->next;
+		}
+		DEBUG(1, ("\n"));
+		return -1;
+	}
+
 	return res;
 }
 
@@ -700,7 +783,7 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 
 	DEBUG(10, ("req->uri_params = %p\n", req->uri_params));
 
-	if (!execute_request(ctx, req)) {
+	if (execute_request(ctx, req)) {
 		DEBUG(0, ("Unable to execute request, disabled\n"));
 		ctx->enabled = false;
 		curl_easy_cleanup(ctx->c_handle);

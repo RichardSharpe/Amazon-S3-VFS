@@ -1,7 +1,9 @@
 CC		= @CC@
-CFLAGS		= -pthread @CFLAGS@
+CFLAGS		= -pthread $(shell xml2-config --cflags)  @CFLAGS@
 CPPFLAGS	= @CPPFLAGS@
-LDFLAGS		= -pthread $(shell curl-config --libs) @LDFLAGS@
+LDFLAGS		= -pthread $(shell curl-config --libs) \
+			$(shell xml2-config --libs) \
+			@LDFLAGS@
 LDSHFLAGS	= @LDSHFLAGS@
 INSTALLCMD	= @INSTALL@
 SAMBA_SOURCE	= @SAMBA_SOURCE@
