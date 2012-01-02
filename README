@@ -12,3 +12,17 @@ To build:
 1. ./autogen.sh
 2. ./configure --with-samba-source=/path/to/samba/source3/
 3. make
+
+You need to add the following fields to the share you want to have push files
+up to Amazon's S3 service:
+
+[the-share]
+	path = /some/path
+	vfs objects = vfs_amazon_s3
+	vfs_amazon_s3:access key = your-access-key
+	vfs_amazon_s3:secret key = your-secret-key
+	vfs_amazon_s3:bucket = the-name-of-the-bucket
+	vfs_amazon_s3:reloc dir = /path/to/some/dir/not/under/the/share
+
+Yes, I know, the secret key needs to be dealt with in a better fashion.
+
