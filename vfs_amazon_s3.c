@@ -27,6 +27,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
+#include <semaphore.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -133,6 +134,16 @@ struct s3_request_struct {
 };
 
 static pthread_t w_thread;
+
+/*
+ * A simple queue guarded by semaphores initially. When stuff is working
+ * this will have to change ...
+ */
+static sem_t send_sem, recv_sem;
+
+struct vsp_extension_struct {
+	bool save_file;           /* Whether the file needs to be uploaded */
+};
 
 /*
  * Perhaps these routines should be placed in a separate library ...
@@ -712,7 +723,8 @@ int execute_request(struct amazon_context_struct *ctx,
 	if (req->response_code != 200) {
 		struct key_value_pair *error = NULL;
 		(void)parse_error_xml(req->response);
-		DEBUG(1, ("Request failed: "));
+		DEBUG(1, ("Request failed: %s, ", 
+			req->response->response_code));
 		error = req->response->error;
 		while (error) {
 			DEBUG(1, ("%s = %s, ",
@@ -793,6 +805,24 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 	 * Free up the request because we are finished with the request
 	 */
 	talloc_free(req); 
+
+	/*
+	 * Initialize the semaphores. send_sem's value sets the size of
+	 * the queue ... Should use variables ...
+	 */
+	res = sem_init(&send_sem, 0, 10); 
+	if (res) {
+		DEBUG(1, ("Unable to initialize send_sem: %s\n",
+			strerror(errno)));
+		return res;
+	}
+
+	res = sem_init(&recv_sem, 0, 0);
+	if (res) {
+		DEBUG(1, ("Unable to initialize recv_sem: %s\n",
+			strerror(errno)));
+		return res;
+	}
 
 	res = pthread_create(&ctx->w_thread, 
 			     NULL, 
@@ -965,8 +995,26 @@ static int amazon_s3_open(vfs_handle_struct *handle,
 			  mode_t mode)
 {
 	int res = -1;
+	bool file_existed = VALID_STAT(smb_fname->st);
+	struct vsp_extension_struct *my_files_stuff;
+
+	my_files_stuff = (struct vsp_extension_struct *)VFS_ADD_FSP_EXTENSION(
+						handle, 
+						fsp,
+						struct vsp_extension_struct,
+						NULL);
+
+	if (!my_files_stuff) {
+		DEBUG(1, ("Unable to allocate space for extension for "
+			"file %s\n",
+			smb_fname_str_dbg(smb_fname)));
+		return res;
+	}
+
+	my_files_stuff->save_file = !file_existed;
 
 	res = SMB_VFS_NEXT_OPEN(handle, smb_fname, fsp, flags, mode);
+
 	return res;
 }
 
@@ -991,6 +1039,8 @@ static NTSTATUS amazon_s3_create_file(vfs_handle_struct *handle,
 				      int *pinfo)
 {
 	NTSTATUS res;
+	bool file_existed = VALID_STAT(smb_fname->st);
+	struct vsp_extension_struct *my_files_stuff;
 
 	res = SMB_VFS_NEXT_CREATE_FILE(handle,
 				       req,
@@ -1008,17 +1058,63 @@ static NTSTATUS amazon_s3_create_file(vfs_handle_struct *handle,
 				       ea_list,
 				       result,
 				       pinfo);
+
+	my_files_stuff = (struct vsp_extension_struct *)VFS_ADD_FSP_EXTENSION(
+						handle, 
+						*result,
+						struct vsp_extension_struct,
+						NULL);
+
+	if (!NT_STATUS_IS_OK(res))
+		return res;  /* Didn't get it, too bad */
+
+	/*
+	 * add our stuff
+	 */
+	if (!my_files_stuff) {
+		DEBUG(1, ("Unable to allocate space for extension for "
+			"file %s\n",
+			smb_fname_str_dbg(smb_fname)));
+		SMB_VFS_CLOSE(*result);  /* Can't leave this open */
+		return NT_STATUS_NO_MEMORY;
+	}
+
+	my_files_stuff->save_file = !file_existed;
+
 	return res;
 }
 
 /*
  * Handle a close ... schedule the file to be moved to S3 if it was written
+ *
+ * What about DELETE ON CLOSE? Do we need to save such files?
  */
 static int amazon_s3_close(vfs_handle_struct *handle, files_struct *fsp)
 {
 	int res;
+	struct vsp_extension_struct *my_stuff = NULL;
 
 	res = SMB_VFS_NEXT_CLOSE(handle, fsp);
+
+	/*
+	 * If something went wrong, don't push this file up ... is that the
+	 * correct decision?
+	 */
+	if (res) {
+		DEBUG(1, ("Closing file %s failed (%s). Not scheduling for "
+			"upload!\n",
+			fsp_str_dbg(fsp),
+			strerror(errno)));
+	}
+
+	my_stuff = (struct vsp_extension_struct *)VFS_FETCH_FSP_EXTENSION(
+							handle,
+							fsp);
+
+	if (my_stuff->save_file) {
+		send_file_to_thread(fsp);
+	}
+
 	return res;
 }
 
