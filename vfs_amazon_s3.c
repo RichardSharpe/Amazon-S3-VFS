@@ -749,6 +749,18 @@ void *amazon_write_thread(void * param)
 }
 
 /*
+ * Send a file to the thread for uploading
+ */
+static bool send_file_to_thread(struct files_struct *fsp)
+{
+
+	DEBUG(10, ("Sending file %s to the write thread\n", 
+		fsp_str_dbg(fsp)));
+
+	return true;
+}
+
+/*
  * Connect to Amazon S3 and create our threads.
  */
 static int amazon_s3_init(struct amazon_context_struct *ctx)
@@ -1112,7 +1124,7 @@ static int amazon_s3_close(vfs_handle_struct *handle, files_struct *fsp)
 							fsp);
 
 	if (my_stuff->save_file) {
-		send_file_to_thread(fsp);
+		(void)send_file_to_thread(fsp);
 	}
 
 	return res;
@@ -1157,8 +1169,28 @@ static ssize_t amazon_s3_write(vfs_handle_struct *handle,
 			       size_t n)
 {
 	ssize_t res;
+	struct vsp_extension_struct *my_stuff = NULL;
 
 	res = SMB_VFS_NEXT_WRITE(handle, fsp, data, n);
+
+	/*
+	 * If something went wrong, don't push this file up ... is that the
+	 * correct decision?
+	 */
+	if (res < 0) {
+		DEBUG(1, ("Writing file %s failed (%s). Not scheduling for "
+			"upload!\n",
+			fsp_str_dbg(fsp),
+			strerror(errno)));
+		return res;
+	}
+
+	my_stuff = (struct vsp_extension_struct *)VFS_FETCH_FSP_EXTENSION(
+							handle,
+							fsp);
+
+	my_stuff->save_file = true;
+
 	return res;
 }
 
@@ -1172,8 +1204,28 @@ static ssize_t amazon_s3_pwrite(vfs_handle_struct *handle,
 				SMB_OFF_T offset)
 {
 	ssize_t res;
+	struct vsp_extension_struct *my_stuff = NULL;
 
 	res = SMB_VFS_NEXT_PWRITE(handle, fsp, data, n, offset);
+
+	/*
+	 * If something went wrong, don't push this file up ... is that the
+	 * correct decision?
+	 */
+	if (res < 0) {
+		DEBUG(1, ("pWriting file %s failed (%s). Not scheduling for "
+			"upload!\n",
+			fsp_str_dbg(fsp),
+			strerror(errno)));
+		return res;
+	}
+
+	my_stuff = (struct vsp_extension_struct *)VFS_FETCH_FSP_EXTENSION(
+							handle,
+							fsp);
+
+	my_stuff->save_file = true;
+
 	return res;
 }
 
