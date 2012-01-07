@@ -1,7 +1,7 @@
 /*
  * Store stuff up on Amazon's S3 service.
  *
- * Copyright (C) Richard Sharpe, 2011
+ * Copyright (C) Richard Sharpe, 2011-2012
  *
  * This program is free software; you can redistribute it and/or modify it 
  * under the terms of the GNU General Public License as published by the 
@@ -31,6 +31,8 @@
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
+
+#include "vfs_amazon_s3.h"
 
 #undef DBGC_CLASS
 #define DBGC_CLASS DBGC_VFS
@@ -67,77 +69,13 @@ static bool curl_global_init_done = false;
  * that exist.
  */
 
-/*
- * Maintains the context for us, and we stash it in the handle
- */
-struct amazon_context_struct {
-	bool enabled;
-	const char *access_key;
-	const char *secret_key;
-	const char *bucket;
-	const char *reloc_dir;
-	int meta_sock;         /* Socket for metadata ops    */
-	CURL *c_handle;
-	pthread_t w_thread;
-	pthread_mutex_t w_mutex;
-	pthread_cond_t w_cond;
-	int write_sock;        /* Socket for upload thread   */
-	pthread_t r_thread;
-	int read_sock;         /* Socket for download thread */
-};
-
-/*
- * We hold any AMZ headers and URI params in this objects ...
- */
-
-struct key_value_pair {
-	struct key_value_pair *next, *prev;
-	char *key_name;
-	char *key_val;
-};
-
-/*
- * We construct the request in an object like this. It is all allocated using
- * talloc. We then transform it into a curl request. This object allows us to
- * easily construct the Authentication header as we have the original data
- * from the request.
- */
-
-struct chunk_list_struct {
-	struct chunk_list_struct *next, *prev;
-	unsigned int chunk_size;
-	uint8_t *chunk;
-};
-
-struct s3_response_struct {
-	char *response_code;           /* The response as a string */
-	struct key_value_pair *headers;
-	struct chunk_list_struct *chunks;
-	struct key_value_pair *error;  /* Might have to move       */
-};
-
-enum request_type_enum {HDR_GET = 0, HDR_POST, HDR_PUT, HDR_DELETE, HDR_HEAD};
-
-struct s3_request_struct {
-	enum request_type_enum request_type;
-	char *content_md5;       /* Kept separate because included in auth */
-	char *content_type;      /* hash, as is this field                 */
-	char date[128];          /* and this field                         */
-	bool has_x_amz_date;     /* In case we have both                   */
-	char *uri;
-	struct key_value_pair *uri_params;
-	struct key_value_pair *amz_headers;
-	long response_code;
-	struct s3_response_struct *response;
-	struct amazon_context_struct *amz_ctx; /* Other stuff we need */
-	void *tmp_context;       /* Used to collect together tmp memory */
-};
-
 static pthread_t w_thread;
 
 /*
  * A simple queue guarded by semaphores initially. When stuff is working
- * this will have to change ...
+ * this will have to change ... however, we can always delay clients if this
+ * little queue is full or close to full, especially if we turn on background
+ * processing of SMB Hello requests.
  */
 static sem_t send_sem, recv_sem;
 
@@ -740,7 +678,10 @@ int execute_request(struct amazon_context_struct *ctx,
 }
 
 /*
- * Upload thread ...
+ * Upload thread ... this idea has problems for a real implementation because
+ * each client gets it own process ... however, it will do for now. We also
+ * have to be able to shut down the thread after the connection goes away, 
+ * but not before it has uploaded all the pending files etc.
  */
 void *amazon_write_thread(void * param)
 {
@@ -749,7 +690,12 @@ void *amazon_write_thread(void * param)
 }
 
 /*
- * Send a file to the thread for uploading
+ * Send a file to the thread for uploading. We have to ensure that the file 
+ * system keeps a reference to it, so create a link to it in the reloc dir.
+ * Use a hash on the path, name, and time of last modification.
+ *
+ * Also, since the fsp is going to go away, we need to create a new structure
+ * to pass to the write thread.
  */
 static bool send_file_to_thread(struct files_struct *fsp)
 {

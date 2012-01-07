@@ -37,7 +37,7 @@ default: $(patsubst %.c,%.$(SHLIBEXT),$(wildcard *.c))
 	@echo "Linking $@"
 	@$(CC) $(LDSHFLAGS) $(LDFLAGS) -o $@ $<
 
-%.$(OBJEXT): %.c
+%.$(OBJEXT): %.c %.h
 	@echo "Compiling $<"
 	@$(CC) $(FLAGS) -c $<
 
