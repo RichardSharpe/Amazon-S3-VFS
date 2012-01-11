@@ -83,3 +83,21 @@ struct s3_request_struct {
 	void *tmp_context;       /* Used to collect together tmp memory */
 };
 
+struct vsp_extension_struct {
+	bool save_file;           /* Whether the file needs to be uploaded */
+};
+
+/*
+ * We send a command to the write thread ... not many at this stage
+ */
+
+#define WRITE_QUEUE_SIZE 10
+
+enum write_thread_enum {WRT_EXIT = 0, WRT_SEND_FILE};
+
+struct write_thread_struct {
+	enum write_thread_enum cmd;
+	char *file_path;           /* The path in the share */
+	char *local_file_path;     /* Where we put it in the file system */
+};
+

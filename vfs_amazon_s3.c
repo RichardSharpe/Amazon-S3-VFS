@@ -27,6 +27,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/md5.h>
+#include <openssl/sha.h>
 #include <semaphore.h>
 
 #include <libxml/parser.h>
@@ -77,11 +78,41 @@ static pthread_t w_thread;
  * little queue is full or close to full, especially if we turn on background
  * processing of SMB Hello requests.
  */
-static sem_t send_sem, recv_sem;
 
-struct vsp_extension_struct {
-	bool save_file;           /* Whether the file needs to be uploaded */
-};
+static sem_t send_sem, recv_sem;
+static struct write_thread_struct *write_cmd_queue[WRITE_QUEUE_SIZE];
+static unsigned int send_index = 0;
+static unsigned int recv_index = 0;
+
+bool send_cmd(struct write_thread_struct *cmd)
+{
+	int res = 0;
+
+	/*
+	 * Is there space? If not we wait 
+	 */
+	res = sem_wait(&send_sem);
+	if (res < 0) {
+		DEBUG(1, ("Failed to wait on the send semaphore: %s\n",
+			strerror(errno)));
+		return false;
+	}
+
+	write_cmd_queue[send_index] = cmd;
+	send_index++;
+
+	/*
+	 * Tell the write thread that it has something to do
+	 */
+	res = sem_send(&recv_sem);
+	if (res < 0) {
+		DEBUG(1, ("Failed to send on the recv semaphore: %s\n",
+			strerror(errno)));
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * Perhaps these routines should be placed in a separate library ...
@@ -122,7 +153,7 @@ static void *get_tmp_context(struct s3_request_struct *req)
 /*
  * Base64 encode a buffer passed in. Return a talloc allocated string.
  */
-static char *base64_enc(struct s3_request_struct *req, 
+static char *base64_enc(void *ctx, 
 			const char *buf,
 			size_t size)
 {
@@ -143,9 +174,7 @@ static char *base64_enc(struct s3_request_struct *req,
 	BIO_get_mem_ptr(b64_filter, &bio_mem);
 
 	/* This should append a terminating null to turn it into a string */
-	ret_str = talloc_strndup(get_tmp_context(req), 
-				 bio_mem->data, 
-				 bio_mem->length);
+	ret_str = talloc_strndup(ctx, bio_mem->data, bio_mem->length);
 
 	BIO_free_all(b64_filter);
 
@@ -153,8 +182,8 @@ static char *base64_enc(struct s3_request_struct *req,
 }
 
 /*
- * Generate the base64 encoded sha1 hash of string str using the secret key 
- * in the amazon_context_struct pointed to in request.
+ * Generate the base64 encoded hmac sha1 hash of string str using the secret 
+ * key in the amazon_context_struct pointed to in request.
  */
 static char *get_hmac_sha1_b64(struct s3_request_struct *req, const char *str)
 {
@@ -169,7 +198,21 @@ static char *get_hmac_sha1_b64(struct s3_request_struct *req, const char *str)
 	     hmac_sha1_buf,
 	     &hmac_sha1_len);
 
-	return base64_enc(req, hmac_sha1_buf, hmac_sha1_len);
+	return base64_enc(get_tmp_context(req), hmac_sha1_buf, hmac_sha1_len);
+}
+
+/*
+ * Generate the base64 encoded sha1 hash of the string in str. This is used
+ * to generate unique names for files based on whatever the caller adds to
+ * the incoming string.
+ */
+static char *get_sha1_b64(void *ctx, const char *str)
+{
+	uint8_t sha1_buf[SHA_DIGEST_LENGTH];
+
+	SHA1(str, strlen(str), sha1_buf);
+
+	return base64_enc(ctx, sha1_buf, sizeof(sha1_buf));
 }
 
 /*
@@ -697,11 +740,43 @@ void *amazon_write_thread(void * param)
  * Also, since the fsp is going to go away, we need to create a new structure
  * to pass to the write thread.
  */
-static bool send_file_to_thread(struct files_struct *fsp)
+static bool send_file_to_thread(struct files_struct *fsp, 
+				struct amazon_context_struct *ctx)
 {
+	struct write_thread_struct *write_cmd = NULL;
 
-	DEBUG(10, ("Sending file %s to the write thread\n", 
-		fsp_str_dbg(fsp)));
+	DEBUG(10, ("Sending file %s/%s to the write thread\n", 
+		fsp->conn->connectpath, fsp_str_dbg(fsp)));
+
+	write_cmd = (struct write_thread_struct *)talloc_zero(talloc_tos(),
+						struct write_thread_struct);
+
+	if (!write_cmd) {
+		DEBUG(1, ("Unable to talloc_zero space for a command: %s\n",
+			strerror(errno)));
+		return false;
+	}
+
+	write_cmd->cmd = WRT_SEND_FILE;
+
+	write_cmd->file_path = talloc_asprintf(write_cmd, "%s/%s",
+						fsp->conn->connectpath,
+						fsp_str_dbg(fsp));
+
+	/*
+	 * Now we have to generate a file name for file in the reloc dir
+	 * because this file might be unlinked before the write thread gets
+	 * to send it to S3 because of delete on close etc.
+	 *
+	 * We generate a hash from:
+	 * 1. The file name and path
+	 * 2. The last modify time
+	 */
+
+	if (!send_cmd(write_cmd)) {
+		DEBUG(1, ("Unable to send command: %s\n", strerror(errno)));
+		return false;
+	}
 
 	return true;
 }
@@ -768,7 +843,7 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 	 * Initialize the semaphores. send_sem's value sets the size of
 	 * the queue ... Should use variables ...
 	 */
-	res = sem_init(&send_sem, 0, 10); 
+	res = sem_init(&send_sem, 0, WRITE_QUEUE_SIZE); 
 	if (res) {
 		DEBUG(1, ("Unable to initialize send_sem: %s\n",
 			strerror(errno)));
@@ -1049,7 +1124,7 @@ static NTSTATUS amazon_s3_create_file(vfs_handle_struct *handle,
  */
 static int amazon_s3_close(vfs_handle_struct *handle, files_struct *fsp)
 {
-	int res;
+	int res = -1;
 	struct vsp_extension_struct *my_stuff = NULL;
 
 	res = SMB_VFS_NEXT_CLOSE(handle, fsp);
@@ -1063,6 +1138,7 @@ static int amazon_s3_close(vfs_handle_struct *handle, files_struct *fsp)
 			"upload!\n",
 			fsp_str_dbg(fsp),
 			strerror(errno)));
+		goto error;
 	}
 
 	my_stuff = (struct vsp_extension_struct *)VFS_FETCH_FSP_EXTENSION(
@@ -1070,9 +1146,17 @@ static int amazon_s3_close(vfs_handle_struct *handle, files_struct *fsp)
 							fsp);
 
 	if (my_stuff->save_file) {
-		(void)send_file_to_thread(fsp);
+		struct amazon_context_struct *ctx;
+
+		SMB_VFS_HANDLE_GET_DATA(handle, 
+					ctx, 
+					struct amazon_context_struct,
+					res = -1; goto error;);
+		(void)send_file_to_thread(fsp, ctx);
 	}
 
+	return res;
+error:
 	return res;
 }
 
