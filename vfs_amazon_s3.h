@@ -98,6 +98,6 @@ enum write_thread_enum {WRT_EXIT = 0, WRT_SEND_FILE};
 struct write_thread_struct {
 	enum write_thread_enum cmd;
 	char *file_path;           /* The path in the share */
-	char *local_file_path;     /* Where we put it in the file system */
+	char *hash_name;           /* Where we put it in the file system */
 };
 

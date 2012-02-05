@@ -100,11 +100,13 @@ bool send_cmd(struct write_thread_struct *cmd)
 
 	write_cmd_queue[send_index] = cmd;
 	send_index++;
+	if (send_index >= WRITE_QUEUE_SIZE)
+		send_index = 0;
 
 	/*
 	 * Tell the write thread that it has something to do
 	 */
-	res = sem_send(&recv_sem);
+	res = sem_post(&recv_sem);
 	if (res < 0) {
 		DEBUG(1, ("Failed to send on the recv semaphore: %s\n",
 			strerror(errno)));
@@ -217,7 +219,7 @@ static char *get_sha1_b64(void *ctx, const char *str)
 
 /*
  * Handle the curl response data. We could probably simplify our chunks by
- * having the header on each chunk be the list as welll. Oh well.
+ * having the header on each chunk be the list as well. Oh well.
  */
 static size_t recv_data(void *data, size_t size, size_t nmemb, void *info)
 {
@@ -247,8 +249,6 @@ out:
 
 /*
  * Parse a header into a KVP ... we are looking for the ':'
- *
- * We might need the length here at some point.
  */
 struct key_value_pair *kvp_parse(struct s3_request_struct *req, 
 				 void *data,
@@ -728,8 +728,94 @@ int execute_request(struct amazon_context_struct *ctx,
  */
 void *amazon_write_thread(void * param)
 {
+	struct amazon_context_struct *ctx = 
+				(struct amazon_context_struct *)param;
+	int res = 0;
+	struct write_thread_struct *cmd = NULL;
+
+	DEBUG(10, ("Write thread starting\n"));
+
+	/*
+	 * Wait for a command. Probably should not be open coded :-)
+	 */
+
+	res = sem_wait(&recv_sem);
+	while (!res || (errno != EINTR)) {
+		/* What about EINTR? */
+
+		cmd = write_cmd_queue[recv_index];
+		recv_index++;
+		if (recv_index >= WRITE_QUEUE_SIZE)
+			recv_index = 0;
+
+		res = sem_post(&send_sem);
+
+		DEBUG(10, ("Got a request for %s as %s\n",
+			cmd->file_path,
+			cmd->hash_name));
+
+		res = sem_wait(&recv_sem);
+	}
+
+	if (res < 0) {
+		DEBUG(1, ("Failed to wait on the send semaphore: %s\n",
+			strerror(errno)));
+		return false;
+	}
+
+	DEBUG(10, ("Write thread terminating\n"));
 
 	return 0;
+}
+
+/*
+ * Convert slash in a base64 encoded hash to underscore ... since we use
+ * these hashes to create files (actually, links to files) so we cannot allow
+ * slashes in them.
+ */
+void convert_slash_to_under(char *str)
+{
+	unsigned int i = 0;
+	unsigned int len = strlen(str);
+
+	for (i = 0; i < len; i++)
+		if (str[i] == '/')
+			str[i] = '_';
+}
+
+static bool hash_link_file(struct write_thread_struct *write_cmd,
+			   struct files_struct *fsp)
+{
+	char *hash_input = NULL;
+
+	hash_input = talloc_asprintf(talloc_tos(), "%s:%lu:%lu",
+				     write_cmd->file_path,
+				     fsp->fsp_name->st.st_ex_ctime.tv_sec,
+				     fsp->fsp_name->st.st_ex_ctime.tv_nsec);
+	if (!hash_input) {
+		DEBUG(1, ("Could not allocate space for hash input: %s\n",
+			strerror(errno)));
+		return false;
+	}
+
+	write_cmd->hash_name = get_sha1_b64(write_cmd, hash_input);
+	convert_slash_to_under(write_cmd->hash_name);
+
+	/*
+	 * There is a NL on the end. Get rid of it. A better way would be 
+	 * to eliminate it in the openssl stuff I am using, though.
+	 */
+	write_cmd->hash_name[strlen(write_cmd->hash_name) - 1] = 0;
+
+	talloc_free(hash_input);  /* Free it here! */
+
+	if (!write_cmd->hash_name) {
+		DEBUG(1, ("Could not get the sha1 value: %s\n",
+			strerror(errno)));
+		return false;
+	}
+
+	return true;
 }
 
 /*
@@ -744,6 +830,9 @@ static bool send_file_to_thread(struct files_struct *fsp,
 				struct amazon_context_struct *ctx)
 {
 	struct write_thread_struct *write_cmd = NULL;
+	char *alt_path = NULL, *real_path = NULL;
+	bool res = true;
+	int ln_res = 0;
 
 	DEBUG(10, ("Sending file %s/%s to the write thread\n", 
 		fsp->conn->connectpath, fsp_str_dbg(fsp)));
@@ -759,9 +848,8 @@ static bool send_file_to_thread(struct files_struct *fsp,
 
 	write_cmd->cmd = WRT_SEND_FILE;
 
-	write_cmd->file_path = talloc_asprintf(write_cmd, "%s/%s",
-						fsp->conn->connectpath,
-						fsp_str_dbg(fsp));
+	write_cmd->file_path = talloc_strdup(write_cmd,
+					     fsp->fsp_name->base_name);
 
 	/*
 	 * Now we have to generate a file name for file in the reloc dir
@@ -771,14 +859,78 @@ static bool send_file_to_thread(struct files_struct *fsp,
 	 * We generate a hash from:
 	 * 1. The file name and path
 	 * 2. The last modify time
+	 *
+	 * Then link the file into the reloc dir with the name generated.
+	 *
+	 * We should probably also put an XATTR on the file with its details
+	 * in case we crash ... this will help with recovery when we come
+	 * back up.
+	 *
+	 * Note, that we do not store the full path because we might want
+	 * to have a separate reloc dir per user in some more sophisticated
+	 * version. Anyway, the write thread knows where the reloc dir is.
 	 */
 
-	if (!send_cmd(write_cmd)) {
-		DEBUG(1, ("Unable to send command: %s\n", strerror(errno)));
+	if (!hash_link_file(write_cmd, fsp)) {
+		DEBUG(1, ("Unable to create hash name for file: %s\n",
+			strerror(errno)));
 		return false;
 	}
 
-	return true;
+	/*
+	 * Now that we have the alternate name, link that name to the original
+	 * file.
+	 */
+
+	alt_path = talloc_asprintf(talloc_tos(), "%s/%s",
+					ctx->reloc_dir,
+					write_cmd->hash_name);
+
+	/* This does not handle alternate data streams! */
+	real_path = talloc_asprintf(talloc_tos(), "%s/%s",
+					fsp->conn->connectpath,
+					fsp->fsp_name->base_name);
+
+	if (!alt_path || !real_path) {
+		DEBUG(1, ("Unable to allocate space for alt_path"
+			" or real_path: %p, %p\n",
+			alt_path,
+			real_path));
+		res = false;
+		goto out;
+	}
+
+	DEBUG(10, ("path for file is %s, alt path: %s\n", 
+		real_path,
+		alt_path));
+
+	/*
+	 * We need to be root to do this ...
+	 */
+	become_root();
+	ln_res = link(real_path, alt_path);
+	unbecome_root();
+	if (ln_res) {
+		DEBUG(10, ("Unable to link %s to %s: %s\n",
+			alt_path, 
+			real_path,
+			strerror(errno)));
+		res = false;
+		goto out;
+	}
+
+	if (!send_cmd(write_cmd)) {
+		DEBUG(1, ("Unable to send command: %s\n", strerror(errno)));
+		res = false;
+		goto out;
+	}
+
+out:
+	talloc_free(alt_path);
+	talloc_free(real_path);
+
+	return res;;
+
 }
 
 /*
