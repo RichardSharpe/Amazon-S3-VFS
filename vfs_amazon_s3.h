@@ -66,12 +66,19 @@ struct s3_response_struct {
 	struct key_value_pair *error;  /* Might have to move       */
 };
 
-enum request_type_enum {HDR_GET = 0, HDR_POST, HDR_PUT, HDR_DELETE, HDR_HEAD};
+enum request_type_enum {
+	HDR_GET = 0, 
+	HDR_POST, 
+	HDR_PUT, 
+	HDR_DELETE, 
+	HDR_HEAD,
+	HDR_INV_REQUEST};
 
 struct s3_request_struct {
 	enum request_type_enum request_type;
 	char *content_md5;       /* Kept separate because included in auth */
 	char *content_type;      /* hash, as is this field                 */
+	off_t content_length;   /* Size of the object ...                 */
 	char date[128];          /* and this field                         */
 	bool has_x_amz_date;     /* In case we have both                   */
 	char *uri;
@@ -81,6 +88,15 @@ struct s3_request_struct {
 	struct s3_response_struct *response;
 	struct amazon_context_struct *amz_ctx; /* Other stuff we need */
 	void *tmp_context;       /* Used to collect together tmp memory */
+
+	/*
+	 * Pointers to functions needed ...
+	 */
+	size_t (*recv_data)(void *data, size_t size, size_t nmemb, void *info);
+	size_t (*recv_hdr)(void *data, size_t size, size_t nmemb, void *info);
+	size_t (*send_data)(void *data, size_t size, size_t nmemb, void *info);
+
+	void *private;  /* Private data if needed above */
 };
 
 struct vsp_extension_struct {
@@ -99,5 +115,8 @@ struct write_thread_struct {
 	enum write_thread_enum cmd;
 	char *file_path;           /* The path in the share */
 	char *hash_name;           /* Where we put it in the file system */
+	off_t file_size;          /* How much data ... */
+	int fd;
+	struct amazon_context_struct *ctx;
 };
 

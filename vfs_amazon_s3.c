@@ -29,6 +29,7 @@
 #include <openssl/md5.h>
 #include <openssl/sha.h>
 #include <semaphore.h>
+#include <fcntl.h>
 
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -292,8 +293,8 @@ static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *info)
 	struct s3_request_struct *req = (struct s3_request_struct *)info;
 	char *data_p = (char *)data;
 
-	DEBUG(11, ("Received size = %zu nmemb = %zu\n", size, nmemb));
-	DEBUG(11, ("Hdr: %s\n", data));
+	DEBUG(10, ("Received size = %zu nmemb = %zu\n", size, nmemb));
+	DEBUG(10, ("Hdr: %s\n", data));
 
 	/*
 	 * Filter out the /r/n empty header
@@ -311,6 +312,7 @@ static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *info)
 	 * below!
 	 */
 	if (!req->response) {
+		DEBUG(10, ("Creating response\n"));
 		req->response = talloc_zero(req, struct s3_response_struct);
 		if (!req->response) {
 			DEBUG(0, ("Unable to allocate space for response! "
@@ -343,15 +345,20 @@ static size_t recv_hdr(void *data, size_t size, size_t nmemb, void *info)
  * at this time, including the data field.
  *
  * We defer creating the response structure until we get the header callback.
+ *
+ * We have separated the talloc_ctx argument from the context argument because
+ * this function is called from the VFS routines and from the write thread,
+ * so we need to esure that the correct talloc context is used.
  */
 static struct s3_request_struct *create_request(enum request_type_enum request_type,
-					 struct amazon_context_struct *ctx)
+					struct amazon_context_struct *ctx,
+					void *talloc_ctx)
 {
 	struct s3_request_struct *req = NULL;
 	time_t sys_time;
 	struct tm tm;
 
-	req = talloc_zero(ctx, struct s3_request_struct);
+	req = talloc_zero(talloc_ctx, struct s3_request_struct);
 	if (!req) {
 		DEBUG(1, ("Unable to allocate s3_request_struct: %s\n",
 			strerror(errno)));
@@ -444,6 +451,17 @@ bool add_param(struct s3_request_struct *req,
 }
 
 /*
+ * Get request type ...
+ */
+static enum request_type_enum get_request_type(struct s3_request_struct *req)
+{
+	if (req)
+		return req->request_type;
+	else
+		return HDR_INV_REQUEST;
+}
+
+/*
  * Construct the correct amazon headers stuff ... 
  */
 static char *get_canon_amz_headers(struct s3_request_struct *req,
@@ -532,7 +550,7 @@ static bool parse_error_xml(struct s3_response_struct *response)
 	xmlDocPtr doc = NULL;
 	xmlNodePtr cur = NULL;
 
-	if (!response->chunks) {
+	if (!response || !response->chunks) {
 		DEBUG(10, ("No XML doc to parse\n"));
 		return res;
 	}
@@ -590,9 +608,14 @@ error:
 /*
  * Execute an HTTP request via CURL, including handling the authorization 
  * header. We handle all the curl stuff here.
+ *
+ * We pass in the curl handle because this must be called from several
+ * places, especially places where we do not want to use the handle in the
+ * context.
  */
 int execute_request(struct amazon_context_struct *ctx, 
-		    struct s3_request_struct *req)
+		    struct s3_request_struct *req,
+		    CURL *c_handle)
 {
 	int res = 0;
 	struct curl_slist *headers = NULL;
@@ -617,7 +640,7 @@ int execute_request(struct amazon_context_struct *ctx,
 
 	DEBUG(10, ("URL: %s\n", url));
 
-	curl_easy_setopt(ctx->c_handle, CURLOPT_URL, url);
+	curl_easy_setopt(c_handle, CURLOPT_URL, url);
 
 	/*
 	 * Add headers ...
@@ -660,18 +683,42 @@ int execute_request(struct amazon_context_struct *ctx,
 
 	headers = curl_slist_append(headers, auth_header);
 
-	c_res = curl_easy_setopt(ctx->c_handle, CURLOPT_HTTPHEADER, headers);
+	c_res = curl_easy_setopt(c_handle, CURLOPT_HTTPHEADER, headers);
 	if (c_res != CURLE_OK) {
 		DEBUG(0, ("Setting headers failed: %s\n", 
 			curl_easy_errstr(c_res)));
 		return -1;
 	}
 
-	curl_easy_setopt(ctx->c_handle, CURLOPT_NOPROGRESS, 1L);
-	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEFUNCTION, recv_data);
-	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEDATA, (void *)req);
-	curl_easy_setopt(ctx->c_handle, CURLOPT_HEADERFUNCTION, recv_hdr);
-	curl_easy_setopt(ctx->c_handle, CURLOPT_WRITEHEADER, (void *)req);
+	curl_easy_setopt(c_handle, CURLOPT_NOPROGRESS, 1L);
+	curl_easy_setopt(c_handle, CURLOPT_WRITEFUNCTION, req->recv_data);
+	curl_easy_setopt(c_handle, CURLOPT_WRITEDATA, (void *)req);
+	curl_easy_setopt(c_handle, CURLOPT_HEADERFUNCTION, req->recv_hdr);
+	curl_easy_setopt(c_handle, CURLOPT_WRITEHEADER, (void *)req);
+
+	/*
+	 * Different requests require different stuff ...
+	 * Be careful about which Curl sessions you are on ... :-)
+	 */
+	switch (get_request_type(req)) {
+	case HDR_GET:
+		break;
+
+	case HDR_PUT:
+		DEBUG(10, ("Content-Length: %lu\n", req->content_length));
+		curl_easy_setopt(c_handle, CURLOPT_UPLOAD, 1L);
+		curl_easy_setopt(c_handle, CURLOPT_PUT, 1L);
+		curl_easy_setopt(c_handle, CURLOPT_INFILESIZE_LARGE,
+				req->content_length);
+		curl_easy_setopt(c_handle, CURLOPT_READFUNCTION,
+					req->send_data);
+		curl_easy_setopt(c_handle, CURLOPT_READDATA, (void *)req);
+		break;
+
+	default:
+
+		break;
+	}
 
 	/*
 	 * At this point we are finished with the tmp storage so delete it 
@@ -679,7 +726,7 @@ int execute_request(struct amazon_context_struct *ctx,
 	 */
 	talloc_free(get_tmp_context(req));
 
-	c_res = curl_easy_perform(ctx->c_handle);
+	c_res = curl_easy_perform(c_handle);
 	if (c_res != CURLE_OK) {
 		DEBUG(0, ("Performing request %s failed: %s\n",
 			get_verb_str(req), 
@@ -690,7 +737,7 @@ int execute_request(struct amazon_context_struct *ctx,
 	/*
 	 * Check the result and etc ...
 	 */ 
-	c_res = curl_easy_getinfo(ctx->c_handle, 
+	c_res = curl_easy_getinfo(c_handle, 
 				  CURLINFO_RESPONSE_CODE,
 				  &req->response_code);
 	if (c_res != CURLE_OK) {
@@ -720,6 +767,98 @@ int execute_request(struct amazon_context_struct *ctx,
 	return res;
 }
 
+static size_t send_data(void *data, size_t size, size_t nmemb, void *info)
+{
+	struct s3_request_struct *req = info;
+	struct write_thread_struct *cmd = req->private;
+	ssize_t res = 0;
+
+	DEBUG(10, ("size = %lu, nmemb = %lu\n", size, nmemb));
+
+	/*
+	 * Do we need to open the file ...
+	 */
+	if (cmd->fd < 0) {
+		int s_errno = 0;
+		char *file_name = talloc_asprintf(cmd, 
+						"%s/%s",
+						cmd->ctx->reloc_dir,
+						cmd->hash_name);
+		if (!file_name) {
+			DEBUG(0, 
+				("Unable to allocate memory for file name!\n"));
+			return 0;
+		}
+		cmd->fd = open(file_name, O_RDONLY, 0666);
+		if (cmd->fd < 0) {
+			DEBUG(0, ("Unable to open file %s (%s)\n",
+				file_name,
+				strerror(errno)));
+			talloc_free(file_name);
+			return 0;
+		}
+
+		DEBUG(10, ("Opened file %s for reading\n", file_name));
+		talloc_free(file_name);
+	}
+
+	res = read(cmd->fd, data, size * nmemb);
+	if (res < 0) {
+		DEBUG(0, ("Failed to read file (%s)\n",
+			strerror(errno)));
+		return 0;
+	}
+
+	DEBUG(10, ("Read %lu bytes of data\n", res));
+
+	return res;
+}
+
+static bool upload_file(struct write_thread_struct *cmd, 
+			struct amazon_context_struct *ctx,
+			CURL *c_handle)
+{
+	struct s3_request_struct *req = NULL;
+
+	req = create_request(HDR_PUT, ctx, cmd);
+
+	/*
+	 * Now, add the things we need ...
+	 */
+
+	if (!set_content_type(req, "binary/octet-stream")) {
+		DEBUG(0, ("Unable to add Content-Type header (%s)\n",
+			strerror(errno)));
+		return false;
+	}
+
+	req->content_length = cmd->file_size;
+
+	if (!set_uri(req, cmd->file_path)) {
+		DEBUG(0, ("Unable to add URI %s (%s)\n",
+			cmd->file_path,
+			strerror(errno)));
+		return false;
+	}
+
+	/*
+	 * Set up the read method and the data to pass to it ...
+	 */
+	req->send_data = send_data;
+	req->recv_hdr = recv_hdr;    /* Will get these too ... */
+	req->private = (void *)cmd;
+	cmd->fd = -1;       /* Not opened yet */
+	cmd->ctx = ctx;     /* Will need this for some info */
+
+	if (execute_request(ctx, req, c_handle)) {
+		DEBUG(0, ("Unable to execute request to %s file %s\n",
+			get_verb_str(req),
+			cmd->file_path));
+	}
+
+	return true;
+}
+
 /*
  * Upload thread ... this idea has problems for a real implementation because
  * each client gets it own process ... however, it will do for now. We also
@@ -732,9 +871,12 @@ void *amazon_write_thread(void * param)
 				(struct amazon_context_struct *)param;
 	int res = 0;
 	struct write_thread_struct *cmd = NULL;
+	CURLcode c_res = CURLE_OK;
+	CURL *c_handle = NULL;
 
 	DEBUG(10, ("Write thread starting\n"));
 
+	c_handle = curl_easy_init();
 	/*
 	 * Wait for a command. Probably should not be open coded :-)
 	 */
@@ -754,6 +896,27 @@ void *amazon_write_thread(void * param)
 			cmd->file_path,
 			cmd->hash_name));
 
+		switch (cmd->cmd) {
+		case WRT_SEND_FILE:
+			if (!upload_file(cmd, ctx, c_handle)) {
+				DEBUG(10, ("Upload of %s from %s failed\n",
+					cmd->file_path, 
+					cmd->hash_name));
+			}
+			break;
+
+		case WRT_EXIT:
+			DEBUG(10, ("Got request to exit ...\n"));
+			goto done;
+			break;
+
+		default:
+			DEBUG(1, ("Unknown command, ignoring ...\n"));
+			break;
+		}
+
+		talloc_free(cmd); /* We can get rid of this now */
+
 		res = sem_wait(&recv_sem);
 	}
 
@@ -763,6 +926,7 @@ void *amazon_write_thread(void * param)
 		return false;
 	}
 
+done:
 	DEBUG(10, ("Write thread terminating\n"));
 
 	return 0;
@@ -837,8 +1001,22 @@ static bool send_file_to_thread(struct files_struct *fsp,
 	DEBUG(10, ("Sending file %s/%s to the write thread\n", 
 		fsp->conn->connectpath, fsp_str_dbg(fsp)));
 
-	write_cmd = (struct write_thread_struct *)talloc_zero(talloc_tos(),
+	/*
+	 * We cannot use talloc_tos() for this object, because this object
+	 * is going to another thread and will be used as a talloc context,
+	 * however, talloc_tos() objects are going away at the end of the 
+	 * current command. 
+	 *
+	 * In the longer term, this may actually have to be a new talloc 
+	 * context. Let's see.
+	 */
+	write_cmd = (struct write_thread_struct *)talloc_zero(ctx,
 						struct write_thread_struct);
+
+	/*
+	 * stat the file first to get some useful info ...
+	 */
+	SMB_VFS_STAT(fsp->conn, fsp->fsp_name);
 
 	if (!write_cmd) {
 		DEBUG(1, ("Unable to talloc_zero space for a command: %s\n",
@@ -848,8 +1026,12 @@ static bool send_file_to_thread(struct files_struct *fsp,
 
 	write_cmd->cmd = WRT_SEND_FILE;
 
-	write_cmd->file_path = talloc_strdup(write_cmd,
-					     fsp->fsp_name->base_name);
+	/*
+	 * We add the slash to make life easier in creating a URI
+	 */
+	write_cmd->file_path = talloc_asprintf(write_cmd,
+					       "/%s",
+					       fsp->fsp_name->base_name);
 
 	/*
 	 * Now we have to generate a file name for file in the reloc dir
@@ -876,6 +1058,8 @@ static bool send_file_to_thread(struct files_struct *fsp,
 			strerror(errno)));
 		return false;
 	}
+
+	write_cmd->file_size = fsp->fsp_name->st.st_ex_size;
 
 	/*
 	 * Now that we have the alternate name, link that name to the original
@@ -929,7 +1113,7 @@ out:
 	talloc_free(alt_path);
 	talloc_free(real_path);
 
-	return res;;
+	return res;
 
 }
 
@@ -957,7 +1141,7 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 
 	ctx->c_handle = curl_easy_init(); /* Init the easy interface */
 
-	req = create_request(HDR_GET, ctx);
+	req = create_request(HDR_GET, ctx, ctx);
 	/*
 	 * Now, add the required headers and then do a get on / to see
 	 * if the user config is correct.
@@ -980,7 +1164,13 @@ static int amazon_s3_init(struct amazon_context_struct *ctx)
 
 	DEBUG(10, ("req->uri_params = %p\n", req->uri_params));
 
-	if (execute_request(ctx, req)) {
+	/*
+	 * Some more items needed, ie, the callback functions and etc
+	 */
+	req->recv_data = recv_data;
+	req->recv_hdr  = recv_hdr;
+
+	if (execute_request(ctx, req, ctx->c_handle)) {
 		DEBUG(0, ("Unable to execute request, disabled\n"));
 		ctx->enabled = false;
 		curl_easy_cleanup(ctx->c_handle);
