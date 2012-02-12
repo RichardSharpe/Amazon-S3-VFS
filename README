@@ -7,6 +7,8 @@ The idea is to allow a Samba share to be a place that you could use to drop
 files into and then have them saved up on Amazon's S3 service as a backup for
 you.
 
+You need libxml2-devel and libcurl-devel.
+
 To build (against the master branch, or a 3.6.x branch with the FSCTL patches):
 
 1. ./autogen.sh
@@ -26,3 +28,23 @@ up to Amazon's S3 service:
 
 Yes, I know, the secret key needs to be dealt with in a better fashion.
 
+Progress.
+
+The latest, as of 11-Feb-2012, is that it now uploads files. However, it only
+uses PUTs to do that, and has a problem with the delimiter. It really should
+use multi-part uploads for large files. It should probably also allow SDs to
+be uploaded, perhaps with some simple encoding/serializing of the SD and the
+data and any alternate data streams.
+
+TODO:
+
+1. Add tests to configure.in for libxml2-devel and libcurl-devel.
+
+2. Fix bugs in upload and add support for multi-part uploads.
+
+3. Add support for getting previous versions via FSCTLs.
+
+4. Support opening and retrieving files up on S3.
+
+5. Add support for uploading any SDs stored in XATTRs (or even permissions) 
+   and perhaps alternate data streams.
